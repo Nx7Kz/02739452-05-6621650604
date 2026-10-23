@@ -12,6 +12,7 @@ Flow:
     >> log_run (ALL_DONE: บันทึกสถานะลง pipeline_runs สำหรับหน้า status บนเว็บ)
 
 ทดสอบกรณีแหล่งล่ม: Trigger DAG w/ config  {"simulate_down": "emsc"}  (คั่นหลายแหล่งด้วย ,)
+ทดสอบเส้นทาง DQ:   Trigger DAG w/ config  {"simulate_bad_rows": 4}  (เพิ่มแถวเสียจำลอง → dq_rejects)
 """
 from __future__ import annotations
 
@@ -70,6 +71,25 @@ def check_simulated_down(source: str):
     down = conf.get("simulate_down") or ctx["params"].get("simulate_down") or ""
     if source.lower() in [s.strip().lower() for s in str(down).split(",") if s.strip()]:
         raise RuntimeError(f"[simulated outage] source {source} is down")
+
+
+def simulated_bad_rows(merged: list[dict]) -> list[dict]:
+    """สร้างแถวเสียจำลอง N แถว (conf simulate_bad_rows) เพื่อทดสอบเส้นทาง DQ → quarantine"""
+    ctx = get_current_context()
+    conf = (ctx["dag_run"].conf or {}) if ctx.get("dag_run") else {}
+    n = int(conf.get("simulate_bad_rows") or ctx["params"].get("simulate_bad_rows") or 0)
+    if n <= 0 or not merged:
+        return []
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    defects = [{"magnitude": 12.5}, {"depth_km": 950.0}, {"event_time_utc": future},
+               {"latitude": None, "longitude": None}]
+    out = []
+    for i in range(n):
+        base = merged[i % len(merged)]
+        out.append({**base, **defects[i % len(defects)], "event_id": f"SIMULATED:{i + 1}",
+                    "region": f"[simulated bad row] {base.get('region') or ''}".strip()})
+    log.warning("[simulated bad rows] injected %d bad events", n)
+    return out
 
 
 def in_scope(r: dict, start: datetime) -> bool:
@@ -385,7 +405,7 @@ EQ_COLS = ["event_id", "event_time_utc", "latitude", "longitude", "depth_km", "m
     catchup=False,
     max_active_runs=1,
     default_args={"retries": 1, "retry_delay": timedelta(seconds=20)},
-    params={"simulate_down": ""},
+    params={"simulate_down": "", "simulate_bad_rows": 0},
     tags=["02739452", "earthquake", "final"],
 )
 def sea_earthquake_pipeline():
@@ -461,7 +481,7 @@ def sea_earthquake_pipeline():
                                "event_id": f"{r['source']}:{r['source_event_id']}",
                                "primary_source": r["source"], "sources": r["source"], "source_count": 1})
         log.info("raw %d -> merged %d (removed %d duplicates)", len(recs), len(merged), len(recs) - len(merged))
-        return merged
+        return merged + simulated_bad_rows(merged)
 
     @task.branch
     def dq_check(merged):

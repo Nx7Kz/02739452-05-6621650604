@@ -1,6 +1,8 @@
 """Dashboard แผ่นดินไหวเอเชียตะวันออกเฉียงใต้ — อ่านข้อมูลจาก PostgreSQL โดยตรง"""
 import html
+import math
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -20,6 +22,33 @@ MAG_SCALE = [[0, "#fde68a"], [0.45, "#f97316"], [1, "#b91c1c"]]
 STATUS_COLORS = {"success": "#22c55e", "degraded": "#eab308", "failed": "#ef4444"}
 PLOT_CONFIG = {"displayModeBar": False}
 
+# ---------- region → ประเทศ (จับคำใน region ของ USGS/EMSC/TMD; เขตชายแดน/ทะเลระหว่างประเทศนับให้ทุกประเทศที่เกี่ยว)
+SEA_COUNTRIES = {  # ประเทศในกรอบข้อมูล (แสดงก่อนในตัวเลือก)
+    "อินโดนีเซีย": r"indonesia|sumatra|\bjava\b|sulawesi|kalimantan|flores sea|banda sea|molucca|maluku|savu sea"
+                   r"|bali sea|halmahera|seram|celebes sea|(?<!east )timor region",
+    "ฟิลิปปินส์": r"philippin|mindanao|luzon|visayas|celebes sea",
+    "ไทย": r"จ\.|thailand",
+    "เมียนมา": r"myanmar|burma",
+    "เวียดนาม": r"vietnam|viet nam",
+    "ลาว": r"\blaos\b",
+    "กัมพูชา": r"cambodia",
+    "มาเลเซีย": r"malaysia|sabah|sarawak",
+    "สิงคโปร์": r"singapore",
+    "บรูไน": r"brunei",
+    "ติมอร์-เลสเต": r"timor[ -]leste|east timor",
+}
+OTHER_COUNTRIES = {
+    "จีน": r"china|xizang|yunnan", "อินเดีย": r"india", "บังกลาเทศ": r"bangladesh", "ไต้หวัน": r"taiwan",
+    "ญี่ปุ่น": r"japan", "ไมโครนีเซีย": r"micronesia", "ปาปัวนิวกินี": r"\bpng\b|papua new guinea",
+}
+COUNTRY_RE = {k: re.compile(v, re.I) for k, v in {**SEA_COUNTRIES, **OTHER_COUNTRIES}.items()}
+UNKNOWN_COUNTRY = "อื่น ๆ / ไม่ระบุ"
+
+
+def countries_of(region) -> list:
+    found = [c for c, rx in COUNTRY_RE.items() if rx.search(region or "")]
+    return found or [UNKNOWN_COUNTRY]
+
 st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap');
@@ -27,9 +56,24 @@ html, body, .stApp, p, li, label, input, textarea, button, h1, h2, h3, h4, h5, h
 [data-testid="stMarkdownContainer"], [data-testid="stMetricValue"], [data-testid="stMetricLabel"],
 div[data-baseweb="select"] div, div[data-baseweb="tab-list"] p {{ font-family: {FONT}; }}
 .block-container {{ padding-top: 3.5rem; padding-bottom: 3rem; max-width: 1400px; }}
-[data-testid="stVerticalBlockBorderWrapper"]:has(> div > [data-testid="stVerticalBlock"]) {{
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) {{
   background: {C['card']}; border-color: {C['border']} !important; border-radius: 14px; }}
 [data-testid="stSidebar"] {{ border-right: 1px solid {C['border']}; }}
+[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) {{
+  background: rgba(255,255,255,.025); border-radius: 12px; }}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{ padding-top: 1rem; }}
+.sb-title {{ font-size: 1.15rem; font-weight: 700; color: {C['text']}; }}
+.sb-group {{ font-weight: 600; color: {C['text']}; font-size: .95rem; }}
+.sb-hint {{ color: {C['muted']}; font-size: .76rem; margin: .1rem 0 .5rem; line-height: 1.4; }}
+.sb-summary {{ border: 1px solid {C['border']}; border-radius: 12px; padding: .7rem .85rem; margin-bottom: .5rem;
+  background: linear-gradient(135deg, rgba(249,115,22,.14), rgba(249,115,22,.03)); }}
+.sb-summary .n {{ color: {C['muted']}; font-size: .85rem; }}
+.sb-summary .n b {{ color: {C['text']}; font-size: 1.25rem; }}
+.sb-summary .bar {{ height: 5px; border-radius: 99px; background: {C['border']}; margin: .4rem 0 .5rem; overflow: hidden; }}
+.sb-summary .bar i {{ display: block; height: 100%; background: {C['accent']}; border-radius: 99px; }}
+.sb-chips {{ display: flex; flex-wrap: wrap; gap: .3rem; }}
+.sb-chips span {{ font-size: .72rem; padding: .12rem .5rem; border-radius: 99px; color: {C['text']};
+  background: rgba(249,115,22,.15); border: 1px solid rgba(249,115,22,.35); }}
 div[data-baseweb="tab-list"] {{ gap: .25rem; }}
 div[data-baseweb="tab-list"] p {{ font-size: 1rem; font-weight: 500; }}
 
@@ -150,18 +194,73 @@ with tab_dash:
     else:
         df["event_time_utc"] = pd.to_datetime(df["event_time_utc"], utc=True)
         df["เวลาไทย"] = df["event_time_utc"].dt.tz_convert("Asia/Bangkok")
+        df["countries"] = df["region"].map(countries_of)
+        df["ประเทศ"] = df["countries"].str.join(", ")
+        country_n = df["countries"].explode().value_counts()
+        country_opts = ([c for c in country_n.index if c in SEA_COUNTRIES]
+                        + [c for c in country_n.index if c not in SEA_COUNTRIES and c != UNKNOWN_COUNTRY]
+                        + [c for c in country_n.index if c == UNKNOWN_COUNTRY])
 
-        # ---------- filters
+        # ---------- filters (ค่าเริ่มต้นเก็บใน session_state เพื่อให้ปุ่ม "ล้างตัวกรอง" รีเซ็ตได้)
+        mmin = math.floor(float(df["magnitude"].min()) * 10) / 10
+        mmax = math.ceil(float(df["magnitude"].max()) * 10) / 10
+        dmax = float(math.ceil(df["depth_km"].fillna(0).max())) or 1.0
+        defaults = {"f_countries": [], "f_region": "", "f_days": 30, "f_mag": (mmin, mmax), "f_depth": (0.0, dmax),
+                    "f_usgs": True, "f_emsc": True, "f_tmd": True, "f_multi": False}
+        ss = st.session_state
+        for k, v in defaults.items():
+            ss.setdefault(k, v)
+        ss["f_countries"] = [c for c in ss["f_countries"] if c in country_opts]  # ข้อมูลเปลี่ยน → ตัดตัวเลือกที่หายไป
+        if not (mmin <= ss["f_mag"][0] <= ss["f_mag"][1] <= mmax):
+            ss["f_mag"] = defaults["f_mag"]
+        if not (0 <= ss["f_depth"][0] <= ss["f_depth"][1] <= dmax):
+            ss["f_depth"] = defaults["f_depth"]
+
+        def reset_filters():
+            for k, v in defaults.items():
+                st.session_state[k] = v
+
+        def group(icon, title, hint):
+            st.markdown(f'<div class="sb-group"><span>{icon}</span> {title}</div><div class="sb-hint">{hint}</div>',
+                        unsafe_allow_html=True)
+
         with st.sidebar:
-            st.markdown("### 🎚️ ตัวกรอง")
-            mmin, mmax = float(df["magnitude"].min()), float(df["magnitude"].max())
-            mag = st.slider("ขนาด (magnitude)", mmin, mmax, (mmin, mmax), 0.1)
-            dmax = float(df["depth_km"].fillna(0).max()) or 1.0
-            depth = st.slider("ความลึก (กม.)", 0.0, dmax, (0.0, dmax), 1.0)
-            days = st.slider("ย้อนหลัง (วัน)", 1, 30, 30)
-            srcs = st.multiselect("แหล่งข้อมูลที่รายงาน", ["USGS", "EMSC", "TMD"], ["USGS", "EMSC", "TMD"])
-            multi_only = st.checkbox("เฉพาะเหตุการณ์ที่ยืนยันจาก ≥2 แหล่ง")
-            region_kw = st.text_input("ค้นหาบริเวณ", placeholder="เช่น Myanmar, Indonesia")
+            st.markdown('<div class="sb-title">🎚️ ตัวกรองข้อมูล</div>'
+                        '<div class="sb-hint">ปรับค่าด้านล่าง แผนที่ กราฟ และตารางในแท็บ Dashboard จะอัปเดตทันที</div>',
+                        unsafe_allow_html=True)
+            summary = st.container()  # เติมทีหลังเมื่อรู้ผลการกรอง
+
+            with st.container(border=True):
+                group("📍", "พื้นที่", "ไม่เลือก = ทุกประเทศ · เลือกได้หลายประเทศ")
+                sel_countries = st.multiselect(
+                    "ประเทศ", country_opts, key="f_countries", placeholder="ทุกประเทศ — กดเพื่อเลือก/พิมพ์ค้นหา",
+                    format_func=lambda c: f"{c} ({country_n[c]:,})", label_visibility="collapsed",
+                    help="เหตุการณ์ในเขตชายแดน/ทะเลระหว่างประเทศนับให้ทุกประเทศที่เกี่ยวข้อง",
+                )
+                region_kw = st.text_input("ค้นหาชื่อบริเวณ", key="f_region", placeholder="🔍 ชื่อบริเวณ เช่น Sumatra, เชียงใหม่",
+                                          label_visibility="collapsed").strip()
+
+            with st.container(border=True):
+                group("🗓️", "ช่วงเวลา", "นับย้อนหลังจากตอนนี้")
+                days = st.select_slider("ย้อนหลัง", [1, 3, 7, 14, 30], key="f_days", label_visibility="collapsed",
+                                        format_func=lambda d: "24 ชม." if d == 1 else f"{d} วัน")
+
+            with st.container(border=True):
+                group("📏", "ขนาดและความลึก", "ลากหัวทั้งสองข้างเพื่อกำหนดช่วง")
+                mag = st.slider("ขนาด (แมกนิจูด)", mmin, mmax, key="f_mag", step=0.1, format="M %.1f",
+                                help="M < 3 มักไม่ค่อยรู้สึก · M 4–5 รู้สึกได้ชัด · M ≥ 5 อาจเกิดความเสียหาย")
+                depth = st.slider("ความลึก (กม.)", 0.0, dmax, key="f_depth", step=1.0, format="%d กม.",
+                                  help="แผ่นดินไหวตื้น (< 70 กม.) มักรู้สึกแรงกว่าที่ระดับขนาดเดียวกัน")
+
+            with st.container(border=True):
+                group("🛰️", "แหล่งข้อมูล", "แสดงเหตุการณ์ที่มีแหล่งที่ติ๊กไว้รายงาน")
+                srcs = [name for name, dot, desc in (("USGS", "blue", "สำนักธรณีวิทยาสหรัฐฯ"),
+                                                     ("EMSC", "violet", "ศูนย์แผ่นดินไหวยุโรป-เมดิเตอร์เรเนียน"),
+                                                     ("TMD", "green", "กรมอุตุนิยมวิทยา"))
+                        if st.checkbox(f":{dot}[●] **{name}** · :gray[{desc}]", key=f"f_{name.lower()}")]
+                multi_only = st.toggle("เฉพาะที่ยืนยันจาก ≥ 2 แหล่ง", key="f_multi",
+                                       help="เหตุการณ์ที่หลายหน่วยงานรายงานตรงกัน (เวลาห่าง ≤ 90 วินาที, ระยะ ≤ 100 กม.)")
+
             st.caption(f"ข้อมูลทั้งหมด {len(df):,} เหตุการณ์ · อัปเดตล่าสุด {last_update}")
 
         since = datetime.now(timezone.utc) - timedelta(days=days)
@@ -171,13 +270,43 @@ with tab_dash:
             & (df["event_time_utc"] >= since)
             & df["sources"].apply(lambda s: any(x in s.split(",") for x in srcs))
         ]
+        if sel_countries:
+            f = f[f["countries"].map(lambda cs: any(c in sel_countries for c in cs))]
         if multi_only:
             f = f[f["source_count"] >= 2]
         if region_kw:
-            f = f[f["region"].fillna("").str.contains(region_kw, case=False)]
+            f = f[f["region"].fillna("").str.contains(region_kw, case=False, regex=False)]
+
+        # ---------- สรุปตัวกรองที่ใช้อยู่ (ด้านบน sidebar)
+        active = []
+        if sel_countries:
+            active.append("📍 " + ", ".join(sel_countries))
+        if region_kw:
+            active.append(f"🔍 “{region_kw}”")
+        if days != 30:
+            active.append("🗓️ " + ("24 ชม." if days == 1 else f"{days} วัน"))
+        if tuple(mag) != defaults["f_mag"]:
+            active.append(f"📏 M {mag[0]:.1f}–{mag[1]:.1f}")
+        if tuple(depth) != defaults["f_depth"]:
+            active.append(f"⬇️ {depth[0]:.0f}–{depth[1]:.0f} กม.")
+        if len(srcs) < 3:
+            active.append("🛰️ " + (" + ".join(srcs) or "ไม่มีแหล่ง"))
+        if multi_only:
+            active.append("✅ ≥ 2 แหล่ง")
+        with summary:
+            pct = len(f) / len(df) * 100
+            st.markdown(
+                f'<div class="sb-summary"><div class="n"><b>{len(f):,}</b> / {len(df):,} เหตุการณ์</div>'
+                f'<div class="bar"><i style="width:{pct:.1f}%"></i></div>'
+                + ('<div class="sb-chips">' + "".join(f"<span>{html.escape(a)}</span>" for a in active) + "</div>"
+                   if active else '<div class="sb-hint" style="margin:0">ยังไม่ได้กรอง — แสดงทั้งหมด</div>')
+                + "</div>", unsafe_allow_html=True)
+            if active:
+                st.button("↺ ล้างตัวกรองทั้งหมด", on_click=reset_filters, use_container_width=True)
 
         if f.empty:
-            st.info("ไม่มีเหตุการณ์ที่ตรงกับตัวกรอง — ลองขยายช่วงขนาด/ความลึก/วัน")
+            st.info("ไม่มีเหตุการณ์ที่ตรงกับตัวกรอง — ลองขยายช่วงขนาด/ความลึก/วัน หรือกด “ล้างตัวกรองทั้งหมด” ในแถบด้านซ้าย"
+                    if srcs else "ยังไม่ได้เลือกแหล่งข้อมูล — ติ๊กอย่างน้อย 1 แหล่งในแถบด้านซ้าย")
         else:
             f = f.assign(
                 mag_class=pd.cut(f["magnitude"], [-10, 3, 4, 5, 20], right=False, labels=MAG_LABELS),
@@ -204,14 +333,23 @@ with tab_dash:
             # ---------- map + top events
             c1, c2 = st.columns([7, 3])
             with c1, st.container(border=True):
-                section("แผนที่ศูนย์กลางแผ่นดินไหว", "ขนาดและสีของจุดตามแมกนิจูด · ชี้ที่จุดเพื่อดูรายละเอียด")
+                section("แผนที่ศูนย์กลางแผ่นดินไหว", "ขนาดและสีของจุดตามแมกนิจูด · ชี้ที่จุดเพื่อดูรายละเอียด"
+                        + (f" · เฉพาะ {', '.join(sel_countries)}" if sel_countries else ""))
+                if sel_countries:  # ซูมไปที่ประเทศที่เลือก
+                    span = max(f["latitude"].max() - f["latitude"].min(), f["longitude"].max() - f["longitude"].min())
+                    center = {"lat": f["latitude"].median(), "lon": f["longitude"].median()}
+                    zoom = min(max(math.log2(300 / (span + 2)), 2.5), 7)
+                else:
+                    center, zoom = {"lat": 8.5, "lon": 116.5}, 3.1
                 fig = px.scatter_mapbox(
                     f.sort_values("magnitude"), lat="latitude", lon="longitude", color="magnitude",
                     size=f.sort_values("magnitude")["magnitude"].clip(lower=0.5) ** 2, size_max=11,
-                    hover_name="region", custom_data=["magnitude", "depth_km", "time_str", "sources_label"],
-                    color_continuous_scale=MAG_SCALE, zoom=3.1, center={"lat": 8.5, "lon": 116.5}, opacity=0.75,
+                    hover_name="region",
+                    custom_data=["magnitude", "depth_km", "time_str", "sources_label", "ประเทศ"],
+                    color_continuous_scale=MAG_SCALE, zoom=zoom, center=center, opacity=0.75,
                 )
-                fig.update_traces(hovertemplate="<b>%{hovertext}</b><br>M %{customdata[0]:.1f} · ลึก %{customdata[1]:.0f} กม."
+                fig.update_traces(hovertemplate="<b>%{hovertext}</b><br>%{customdata[4]}"
+                                                "<br>M %{customdata[0]:.1f} · ลึก %{customdata[1]:.0f} กม."
                                                 "<br>%{customdata[2]}<br>แหล่ง: %{customdata[3]}<extra></extra>")
                 # carto ต้องใช้ API key แล้ว → ใช้ tile Esri Dark Gray (ไม่ต้องใช้ key) แทน
                 fig.update_layout(
@@ -297,8 +435,8 @@ with tab_dash:
                 t1, t2 = st.columns([4, 1])
                 with t1:
                     section("ตารางข้อมูล", f"{len(f):,} เหตุการณ์ตามตัวกรอง")
-                cols = ["เวลาไทย", "magnitude", "mag_type", "depth_km", "latitude", "longitude", "region",
-                        "sources", "mag_usgs", "mag_emsc", "mag_tmd"]
+                cols = ["เวลาไทย", "magnitude", "mag_type", "depth_km", "latitude", "longitude", "ประเทศ",
+                        "region", "sources", "mag_usgs", "mag_emsc", "mag_tmd"]
                 with t2:
                     st.download_button("⬇️ ดาวน์โหลด CSV", f[cols].to_csv(index=False).encode("utf-8-sig"),
                                        "sea_earthquakes.csv", "text/csv", use_container_width=True)
