@@ -1,0 +1,9 @@
+# DAG (ติดตั้งมากับ image apache/airflow แล้ว)
+apache-airflow==2.10.3
+requests>=2.31
+psycopg2-binary>=2.9
+# Web dashboard
+streamlit==1.39.0
+pandas>=2.1
+plotly>=5.20
+SQLAlchemy>=2.0
